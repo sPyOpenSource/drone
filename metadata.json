@@ -1,0 +1,6 @@
+{
+  "name": "Drone Simulator",
+  "description": "An advanced FPV drone simulator featuring Acro/Angle flight modes, realistic rigid-body physics, procedural motor audio synthesis, multi-mission challenges, and real-time cockpit telemetry HUD.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
