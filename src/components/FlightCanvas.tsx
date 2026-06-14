@@ -6,8 +6,47 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Telemetry, FlightMode, EnvironmentSettings, RingGate, CargoPackage, Vector3 } from '../types';
 import { droneAudio } from '../audio';
-import { Gamepad, HelpCircle, Magnet, RotateCcw, ShieldAlert, Sparkles, Navigation } from 'lucide-react';
+import { Gamepad, HelpCircle, Magnet, RotateCcw, ShieldAlert, Sparkles, Navigation, Eye, Play, Pause, SkipBack, History, Download, Upload } from 'lucide-react';
 import { TelemetryHUD } from './TelemetryHUD';
+
+export interface RecordedFrame {
+  // Drone dynamics
+  rx: number;
+  ry: number;
+  rz: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  pitch: number;
+  roll: number;
+  yaw: number;
+  dpitch: number;
+  droll: number;
+  dyaw: number;
+  throttle: number;
+  battery: number;
+  voltage: number;
+  tempC: number;
+  activeMotorV: [number, number, number, number];
+
+  // Cargo Dynamics
+  cargoX: number;
+  cargoY: number;
+  cargoZ: number;
+  cargoVx: number;
+  cargoVy: number;
+  cargoVz: number;
+  cargoAttached: boolean;
+  cargoDelivered: boolean;
+
+  // Mission Info
+  winchStatus: 'IDLE' | 'DEPLOYED' | 'LOCKED';
+  gates: Array<{ id: string; passed: boolean; active: boolean }>;
+  gatesPassedCount: number;
+  score: number;
+  timeElapsed: number;
+  activeMissionId: string;
+}
 
 interface FlightCanvasProps {
   mode: FlightMode;
@@ -45,8 +84,47 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // View state: 'FPV' or 'CHASE' (Third-Person)
-  const [cameraView, setCameraView] = useState<'FPV' | 'CHASE'>('FPV');
+  // View state: 'FPV', 'CHASE', 'SPECTATOR' or 'ORBIT'
+  const [cameraView, setCameraView] = useState<'FPV' | 'CHASE' | 'SPECTATOR' | 'ORBIT'>('FPV');
+  const [isVrMode, setIsVrMode] = useState<boolean>(false);
+
+  // Flight Data Recorder (FDR) state management
+  const [isReplayMode, _setReplayMode] = useState(false);
+  const isReplayModeRef = useRef(false);
+  const setReplayMode = (val: boolean) => {
+    isReplayModeRef.current = val;
+    _setReplayMode(val);
+  };
+
+  const [isPlayingReplay, _setPlayingReplay] = useState(false);
+  const isPlayingReplayRef = useRef(false);
+  const setPlayingReplay = (val: boolean) => {
+    isPlayingReplayRef.current = val;
+    _setPlayingReplay(val);
+  };
+
+  const [replaySpeed, _setReplaySpeed] = useState(1.0);
+  const replaySpeedRef = useRef(1.0);
+  const updateReplaySpeed = (val: number) => {
+    replaySpeedRef.current = val;
+    _setReplaySpeed(val);
+  };
+
+  const [replayIndex, _setReplayIndex] = useState(0);
+  const replayIndexRef = useRef(0);
+  const setReplayIndex = (val: number) => {
+    _setReplayIndex(val);
+  };
+  const updateReplayIndex = (val: number) => {
+    replayIndexRef.current = val;
+    _setReplayIndex(val);
+  };
+
+  const [hasLastFlight, setHasLastFlight] = useState(false);
+
+  // In-memory telemetry frames for recording & playback
+  const activeSessionFrames = useRef<RecordedFrame[]>([]);
+  const lastSessionFrames = useRef<RecordedFrame[]>([]);
 
   // Winch connection status in UI
   const [winchStatus, setWinchStatus] = useState<'IDLE' | 'DEPLOYED' | 'LOCKED'>('IDLE');
@@ -67,11 +145,11 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
 
   // Setup Drone Physical variables with refs to keep 60fps loop clean and in sync
   const droneState = useRef({
-    rx: 0, ry: 4, rz: 0,     // Positions
+    rx: 0, ry: 0, rz: 0,     // Positions
     vx: 0, vy: 0, vz: 0,     // Velocities
     pitch: 0, roll: 0, yaw: 0, // Attitudes (radians)
     dpitch: 0, droll: 0, dyaw: 0, // Angular speeds
-    throttle: 0.45,
+    throttle: 0,
     battery: 100,
     voltage: 16.8,
     tempC: 38,
@@ -106,12 +184,12 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
     // Default start positions
     droneState.current = {
       rx: 0,
-      ry: 5, // start slightly hovering
+      ry: 0, // start slightly hovering
       rz: 0,
       vx: 0, vy: 0, vz: 0,
       pitch: 0, roll: 0, yaw: 0,
       dpitch: 0, droll: 0, dyaw: 0,
-      throttle: 0.45,
+      throttle: 0,
       battery: 100,
       voltage: dronePreset === 'racer' ? 16.8 : 25.2, // 4S vs 6S battery
       tempC: 36,
@@ -172,7 +250,15 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
 
       // Handle custom utility keys
       if (e.key === 'c' || e.key === 'C') {
-        setCameraView((prev) => (prev === 'FPV' ? 'CHASE' : 'FPV'));
+        setCameraView((prev) => {
+          if (prev === 'FPV') return 'CHASE';
+          if (prev === 'CHASE') return 'SPECTATOR';
+          if (prev === 'SPECTATOR') return 'ORBIT';
+          return 'FPV';
+        });
+      }
+      if (e.key === 'v' || e.key === 'V') {
+        setIsVrMode((prev) => !prev);
       }
       if (e.key === 'r' || e.key === 'R') {
         initializeSimulation();
@@ -307,19 +393,96 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
 
     animationFrameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animationFrameId);
-  }, [cameraView, currentMissionId, environment, mode, dronePreset]);
+  }, [cameraView, isVrMode, currentMissionId, environment, mode, dronePreset]);
 
   // Simple Timer ticker (1s)
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!activeCrash.current) {
+      if (!activeCrash.current && !isReplayModeRef.current) {
         timeElapsed.current += 1;
       }
     }, 1000);
     return () => clearInterval(timer);
   }, []);
 
+  const applyReplayFrame = (idx: number) => {
+    const list = lastSessionFrames.current;
+    if (list.length === 0) return;
+    
+    // Clamp idx to safety boundaries
+    const safeIdx = Math.max(0, Math.min(list.length - 1, idx));
+    const frame = list[safeIdx];
+    
+    // 1. Update droneState.current
+    droneState.current.rx = frame.rx;
+    droneState.current.ry = frame.ry;
+    droneState.current.rz = frame.rz;
+    droneState.current.vx = frame.vx;
+    droneState.current.vy = frame.vy;
+    droneState.current.vz = frame.vz;
+    droneState.current.pitch = frame.pitch;
+    droneState.current.roll = frame.roll;
+    droneState.current.yaw = frame.yaw;
+    droneState.current.dpitch = frame.dpitch;
+    droneState.current.droll = frame.droll;
+    droneState.current.dyaw = frame.dyaw;
+    droneState.current.throttle = frame.throttle;
+    droneState.current.battery = frame.battery;
+    droneState.current.voltage = frame.voltage;
+    droneState.current.tempC = frame.tempC;
+    droneState.current.activeMotorV = [...frame.activeMotorV] as [number, number, number, number];
+    
+    // 2. Update levelCargo.current
+    levelCargo.current.position.x = frame.cargoX;
+    levelCargo.current.position.y = frame.cargoY;
+    levelCargo.current.position.z = frame.cargoZ;
+    levelCargo.current.velocity.x = frame.cargoVx;
+    levelCargo.current.velocity.y = frame.cargoVy;
+    levelCargo.current.velocity.z = frame.cargoVz;
+    levelCargo.current.isAttached = frame.cargoAttached;
+    levelCargo.current.isDelivered = frame.cargoDelivered;
+    
+    // Set Winch UI status matching frame cargo
+    setWinchStatus(frame.winchStatus);
+    
+    // 3. Update levelGates.current (to make rings green/red or passed correctly in replay)
+    levelGates.current.forEach((gate, gIdx) => {
+      const recordedGate = frame.gates[gIdx];
+      if (recordedGate) {
+        gate.passed = recordedGate.passed;
+        gate.active = recordedGate.active;
+      }
+    });
+    
+    gatesPassedCount.current = frame.gatesPassedCount;
+    scores.current = frame.score;
+    timeElapsed.current = frame.timeElapsed;
+  };
+
   const updatePhysics = (dt: number) => {
+    // If replaying, override physics and advance the replay index!
+    if (isReplayModeRef.current) {
+      if (isPlayingReplayRef.current && lastSessionFrames.current.length > 0) {
+        const fps = 60; // Approximate simulator tick frequency
+        const deltaFrames = dt * fps * replaySpeedRef.current;
+        let newIdx = replayIndexRef.current + deltaFrames;
+        
+        if (newIdx >= lastSessionFrames.current.length) {
+          newIdx = 0; // loop replay from beginning automatically!
+        }
+        
+        replayIndexRef.current = newIdx;
+        setReplayIndex(newIdx); // update slider position
+        applyReplayFrame(Math.floor(newIdx));
+      }
+      
+      // Update replayed motor hums & sounds dynamically
+      const d = droneState.current;
+      const droneSpeed = Math.sqrt(d.vx * d.vx + d.vy * d.vy + d.vz * d.vz);
+      droneAudio.update(d.throttle, d.activeMotorV, droneSpeed);
+      return;
+    }
+
     if (activeCrash.current) {
       crashAnimationTimer.current += dt;
       if (crashAnimationTimer.current > 1.8) {
@@ -575,7 +738,7 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
         d.roll *= 0.8;
       } else {
         // Catastrophic crash
-        triggerDroneCrash('GROUND COLLISION IMPACT');
+        //triggerDroneCrash('GROUND COLLISION IMPACT');
       }
     }
 
@@ -663,6 +826,53 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
     // Update synthetic sound pitch dynamically
     const droneSpeed = Math.sqrt(d.vx*d.vx + d.vy*d.vy + d.vz*d.vz);
     droneAudio.update(d.throttle, d.activeMotorV, droneSpeed);
+
+    // --- Record flight telemetry data frame inside FDR buffer ---
+    if (!isReplayModeRef.current) {
+      const activeFrameGates = levelGates.current.map(g => ({
+        id: g.id,
+        passed: g.passed,
+        active: g.active
+      }));
+
+      const activeFrame: RecordedFrame = {
+        rx: d.rx,
+        ry: d.ry,
+        rz: d.rz,
+        vx: d.vx,
+        vy: d.vy,
+        vz: d.vz,
+        pitch: d.pitch,
+        roll: d.roll,
+        yaw: d.yaw,
+        dpitch: d.dpitch,
+        droll: d.droll,
+        dyaw: d.dyaw,
+        throttle: d.throttle,
+        battery: d.battery,
+        voltage: d.voltage,
+        tempC: d.tempC,
+        activeMotorV: [...d.activeMotorV] as [number, number, number, number],
+
+        cargoX: levelCargo.current.position.x,
+        cargoY: levelCargo.current.position.y,
+        cargoZ: levelCargo.current.position.z,
+        cargoVx: levelCargo.current.velocity.x,
+        cargoVy: levelCargo.current.velocity.y,
+        cargoVz: levelCargo.current.velocity.z,
+        cargoAttached: levelCargo.current.isAttached,
+        cargoDelivered: levelCargo.current.isDelivered,
+
+        winchStatus: winchStatus,
+        gates: activeFrameGates,
+        gatesPassedCount: gatesPassedCount.current,
+        score: scores.current,
+        timeElapsed: timeElapsed.current,
+        activeMissionId: currentMissionId
+      };
+
+      activeSessionFrames.current.push(activeFrame);
+    }
   };
 
   const triggerDroneCrash = (reasonText: string) => {
@@ -686,92 +896,163 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
     const width = canvas.width;
     const height = canvas.height;
 
-    // Clear with selected Time of Day background
-    let timeColorStart = '#0b0c10';
-    let timeColorEnd = '#1f2833';
+    const eyes: Array<'left' | 'right' | 'full'> = isVrMode ? ['left', 'right'] : ['full'];
 
-    if (environment.timeOfDay === 'DAY') {
-      timeColorStart = '#2b5876';
-      timeColorEnd = '#4e4376'; // Beautiful corporate bluish purplish day preset
-    } else if (environment.timeOfDay === 'SUNSET') {
-      timeColorStart = '#4a2c5a';
-      timeColorEnd = '#bf5e34'; // Hot orange sunset skyline
-    }
+    for (const eye of eyes) {
+      ctx.save();
+      
+      // Eye-specific Clipping
+      ctx.beginPath();
+      if (eye === 'left') {
+        ctx.rect(0, 0, width / 2, height);
+      } else if (eye === 'right') {
+        ctx.rect(width / 2, 0, width / 2, height);
+      } else {
+        ctx.rect(0, 0, width, height);
+      }
+      ctx.clip();
 
-    const skyGrad = ctx.createLinearGradient(0, 0, 0, height);
-    skyGrad.addColorStop(0, timeColorStart);
-    skyGrad.addColorStop(1, timeColorEnd);
-    ctx.fillStyle = skyGrad;
-    ctx.fillRect(0, 0, width, height);
+      // Clear with selected Time of Day background inside the clipped eye view
+      let timeColorStart = '#0b0c10';
+      let timeColorEnd = '#1f2833';
 
-    // Camera mathematics variables depending on view selection
-    const d = droneState.current;
-    let camX = d.rx;
-    let camY = d.ry;
-    let camZ = d.rz;
-    let yaw = d.yaw;
-    let pitch = d.pitch;
-    let roll = d.roll;
+      if (environment.timeOfDay === 'DAY') {
+        timeColorStart = '#2b5876';
+        timeColorEnd = '#4e4376'; // Beautiful corporate day sky
+      } else if (environment.timeOfDay === 'SUNSET') {
+        timeColorStart = '#4a2c5a';
+        timeColorEnd = '#bf5e34'; // Orange sunset skyline
+      }
 
-    if (cameraView === 'CHASE') {
-      // In chase pursuit camera mode: position camera 10m back and 2.5m up relative to drone yaw heading
-      const camDistLimit = 9.0;
-      const camHeightAbove = 3.0;
+      const skyGrad = ctx.createLinearGradient(0, 0, 0, height);
+      skyGrad.addColorStop(0, timeColorStart);
+      skyGrad.addColorStop(1, timeColorEnd);
+      ctx.fillStyle = skyGrad;
+      ctx.fillRect(0, 0, width, height);
 
-      // Rotate camera back based on drone yaw direction
-      const backX = -Math.sin(d.yaw) * camDistLimit;
-      const backZ = -Math.cos(d.yaw) * camDistLimit;
+      // Camera mathematics variables depending on view selection
+      const d = droneState.current;
+      let camX = d.rx;
+      let camY = d.ry;
+      let camZ = d.rz;
+      let yaw = d.yaw;
+      let pitch = d.pitch;
+      let roll = d.roll;
 
-      camX = d.rx + backX;
-      camY = d.ry + camHeightAbove;
-      camZ = d.rz + backZ;
+      if (cameraView === 'CHASE') {
+        // In chase pursuit camera mode: position camera 10m back and 2.5m up relative to drone yaw heading
+        const camDistLimit = 9.0;
+        const camHeightAbove = 3.0;
 
-      // Soft damping camera angles looking toward drone position
-      yaw = d.yaw;
-      pitch = 0.18; // tilt slightly down to observe drone frame
-      roll = d.roll * 0.4; // follow rolls gently
-    }
+        // Rotate camera back based on drone yaw direction
+        const backX = -Math.sin(d.yaw) * camDistLimit;
+        const backZ = -Math.cos(d.yaw) * camDistLimit;
 
-    // 3D vector math projector function
-    const project3D = (x: number, y: number, z: number) => {
-      const dx = x - camX;
-      const dy = y - camY;
-      const dz = z - camZ;
+        camX = d.rx + backX;
+        camY = d.ry + camHeightAbove;
+        camZ = d.rz + backZ;
 
-      // Rotate around active camera Yaw (Y axis)
-      const cY = Math.cos(-yaw), sY = Math.sin(-yaw);
-      const rx1 = dx * cY - dz * sY;
-      const rz1 = dx * sY + dz * cY;
+        // Soft damping camera angles looking toward drone position
+        yaw = d.yaw;
+        pitch = 0.18; // tilt slightly down to observe drone frame
+        roll = d.roll * 0.4; // follow rolls gently
+      } else if (cameraView === 'SPECTATOR') {
+        // High static tripod tracker stationed slightly to the side of the launch area
+        camX = 20;
+        camY = 12;
+        camZ = 20;
 
-      // Rotate around Camera pitch tilt (X axis)
-      const cP = Math.cos(-pitch), sP = Math.sin(-pitch);
-      const ry2 = dy * cP - rz1 * sP;
-      const rz2 = dy * sP + rz1 * cP;
+        // Vector pointing from spectator camera position to the drone
+        const dx = d.rx - camX;
+        const dy = d.ry - camY;
+        const dz = d.rz - camZ;
 
-      // Rotate around Camera roll tilt (Z axis)
-      const cR = Math.cos(-roll), sR = Math.sin(-roll);
-      const rx3 = rx1 * cR - ry2 * sR;
-      const ry3 = rx1 * sR + ry2 * cR;
+        // Calculate yaw and pitch angles looking towards the drone
+        yaw = Math.atan2(dx, dz);
+        const dist2D = Math.sqrt(dx * dx + dz * dz);
+        pitch = Math.atan2(dy, dist2D);
+        roll = 0; // maintain horizon level
+      } else if (cameraView === 'ORBIT') {
+        // Orbiting camera slowly rotating around the drone
+        const orbitTime = performance.now() / 3000; // time-based angle
+        const orbitRadius = 9.0;
+        
+        camX = d.rx + Math.sin(orbitTime) * orbitRadius;
+        camY = d.ry + 3.0;
+        camZ = d.rz + Math.cos(orbitTime) * orbitRadius;
 
-      return {
-        x: rx3,
-        y: ry3,
-        z: rz2, // positive is ahead
+        // Vector pointing from orbit camera position to the drone
+        const dx = d.rx - camX;
+        const dy = d.ry - camY;
+        const dz = d.rz - camZ;
+
+        // Calculate yaw and pitch angles looking towards the drone
+        yaw = Math.atan2(dx, dz);
+        const dist2D = Math.sqrt(dx * dx + dz * dz);
+        pitch = Math.atan2(dy, dist2D);
+        roll = 0; // level look
+      }
+
+      // -------------------------------------------------------------
+      // Stereoscopic IPD physical translation offset
+      // -------------------------------------------------------------
+      if (eye !== 'full') {
+        const ipdMultiplier = 0.35; // optimal interpupillary separation
+        const shiftDir = eye === 'left' ? -1 : 1;
+        
+        // Offset perpendicular to horizontal yaw direction
+        const ox = Math.cos(yaw) * ipdMultiplier * shiftDir;
+        const oz = -Math.sin(yaw) * ipdMultiplier * shiftDir;
+        camX += ox;
+        camZ += oz;
+      }
+
+      // 3D vector math projector function
+      const project3D = (x: number, y: number, z: number) => {
+        const dx = x - camX;
+        const dy = y - camY;
+        const dz = z - camZ;
+
+        // Rotate around active camera Yaw (Y axis)
+        const cY = Math.cos(-yaw), sY = Math.sin(-yaw);
+        const rx1 = dx * cY - dz * sY;
+        const rz1 = dx * sY + dz * cY;
+
+        // Rotate around Camera pitch tilt (X axis)
+        const cP = Math.cos(-pitch), sP = Math.sin(-pitch);
+        const ry2 = dy * cP - rz1 * sP;
+        const rz2 = dy * sP + rz1 * cP;
+
+        // Rotate around Camera roll tilt (Z axis)
+        const cR = Math.cos(-roll), sR = Math.sin(-roll);
+        const rx3 = rx1 * cR - ry2 * sR;
+        const ry3 = rx1 * sR + ry2 * cR;
+
+        return {
+          x: rx3,
+          y: ry3,
+          z: rz2, // positive is ahead
+        };
       };
-    };
 
-    // Mapping 3D projected coordinate into 2D canvas pixels
-    const getScreenCoord = (proj: { x: number; y: number; z: number }) => {
-      const fv = 400; // view focus depth
-      const cx = width / 2;
-      const cy = height / 2;
+      // Mapping 2D projected coordinate into 2D canvas pixels
+      const getScreenCoord = (proj: { x: number; y: number; z: number }) => {
+        const fv = eye !== 'full' ? 240 : 400; // slightly wider lens/field of view for VR projection
+        
+        let cx = width / 2;
+        if (eye === 'left') {
+          cx = width / 4;
+        } else if (eye === 'right') {
+          cx = width * 3 / 4;
+        }
+        const cy = height / 2;
 
-      return {
-        x: cx + (proj.x * fv) / proj.z,
-        y: cy - (proj.y * fv) / proj.z, // canvas inverted vertical axis
-        scale: fv / proj.z,
+        return {
+          x: cx + (proj.x * fv) / proj.z,
+          y: cy - (proj.y * fv) / proj.z, // canvas inverted vertical axis
+          scale: fv / proj.z,
+        };
       };
-    };
 
     // Grid details limits
     const gridStart = -150;
@@ -1039,7 +1320,7 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
     });
 
     // --- Draw Chase pursuit perspective drone frame silhouette ---
-    if (cameraView === 'CHASE') {
+    if (cameraView !== 'FPV') {
       const droneCenterP = project3D(d.rx, d.ry, d.rz);
       if (droneCenterP.z > 0.2) {
         const dS = getScreenCoord(droneCenterP);
@@ -1148,6 +1429,9 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
         }
       }
     }
+
+      ctx.restore();
+    }
   };
 
   // Setup Joystick positions logic on mouse coordinate tracking
@@ -1228,6 +1512,71 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
     setRightStick({ x: 0, y: 0 });
   };
 
+  const formatTime = (totalSecs: number) => {
+    const mins = Math.floor(totalSecs / 60);
+    const secs = Math.floor(totalSecs % 60);
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const exportFlightLog = () => {
+    const listToExport = isReplayModeRef.current ? lastSessionFrames.current : activeSessionFrames.current;
+    if (listToExport.length === 0) {
+      alert("No flight data to export yet. Take off first!");
+      return;
+    }
+    
+    try {
+      const dataStr = JSON.stringify({
+        recordedAt: new Date().toISOString(),
+        missionId: currentMissionId,
+        dronePreset: dronePreset,
+        framesCount: listToExport.length,
+        frames: listToExport
+      }, null, 2);
+      
+      const blob = new Blob([dataStr], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `drone_flight_log_${currentMissionId}_${Date.now()}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error(err);
+      alert("Error exporting flight log!");
+    }
+  };
+
+  const importFlightLog = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const parsed = JSON.parse(event.target?.result as string);
+        if (parsed && Array.isArray(parsed.frames) && parsed.frames.length > 0) {
+          lastSessionFrames.current = parsed.frames;
+          setHasLastFlight(true);
+          updateReplayIndex(0);
+          applyReplayFrame(0);
+          setReplayMode(true);
+          setPlayingReplay(true);
+          
+          alert(`Success! Loaded Flight Log: ${parsed.frames.length} frames.`);
+        } else {
+          alert("Invalid Flight Log format. No frames found.");
+        }
+      } catch (err) {
+        console.error(err);
+        alert("Failed to parse Flight Log JSON file.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
   return (
     <div className="relative flex-1 bg-[#0b0c10] flex flex-col justify-between overflow-hidden h-full">
       {/* Simulation Screen Window with absolute OSD Overlay items */}
@@ -1243,7 +1592,34 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
         />
 
         {/* Floating Utilities Top buttons triggers */}
-        <div className="absolute top-4 left-44 z-30 flex gap-2 pointer-events-auto">
+        <div className="absolute top-4 left-4 sm:left-44 z-30 flex gap-2 pointer-events-auto">
+          <button
+            id="camera-view-toggle"
+            onClick={() => setCameraView((prev) => {
+              if (prev === 'FPV') return 'CHASE';
+              if (prev === 'CHASE') return 'SPECTATOR';
+              if (prev === 'SPECTATOR') return 'ORBIT';
+              return 'FPV';
+            })}
+            className="p-2 px-3 bg-neutral-900/80 hover:bg-neutral-800 rounded-lg text-xs font-mono font-bold text-neutral-200 border border-neutral-800 shadow-md flex items-center gap-1.5 transition pointer-events-auto active:scale-95"
+            title="Toggle Perspective Camera perspective profile (C key)"
+          >
+            <Eye className="w-4 h-4 text-[#00ffcc]" /> CAM: {cameraView}
+          </button>
+
+          <button
+            id="vr-view-toggle"
+            onClick={() => setIsVrMode((prev) => !prev)}
+            className={`p-2 px-3 rounded-lg text-xs font-mono font-bold border shadow-md flex items-center gap-1.5 transition pointer-events-auto active:scale-95 ${
+              isVrMode
+                ? 'bg-emerald-950/80 border-emerald-500 text-emerald-300'
+                : 'bg-neutral-900/80 border-neutral-800 text-neutral-300 hover:bg-neutral-850'
+            }`}
+            title="Toggle Side-By-Side (SBS) VR Stereoscopic Split (V key)"
+          >
+            <Sparkles className="w-4 h-4 text-[#00ffcc]" /> VR SBS: {isVrMode ? 'ON' : 'OFF'}
+          </button>
+
           {currentMissionId === 'CARGO' && (
             <button
               id="winch-clamp-trigger"
@@ -1266,13 +1642,207 @@ export const FlightCanvas: React.FC<FlightCanvasProps> = ({
           telemetry={telemetry}
           mode={mode}
           missionName={missionName}
-          missionStatusText={missionStatusText}
+          //missionStatusText={missionStatusText}
           isMissionSuccess={isMissionSuccess}
           score={score}
           timeElapsed={telemetry.flightTime}
           hasCargo={hasCargo}
           cargoDelivered={cargoDelivered}
+          isVrMode={isVrMode}
         />
+
+        {/* Flight Data Recorder HUD Deck */}
+        <div className="absolute bottom-4 left-4 right-4 z-30 pointer-events-auto flex flex-col gap-2 bg-neutral-950/95 backdrop-blur-md rounded-xl p-3 border border-neutral-800 shadow-xl max-w-4xl mx-auto">
+          {/* Upper row: FDR status, frame metrics, camera toggling, and export */}
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] sm:text-xs font-mono">
+            
+            {/* FDR Left status */}
+            <div className="flex items-center gap-2">
+              {isReplayMode ? (
+                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-sky-950 text-sky-400 border border-sky-500/35 rounded font-bold animate-pulse">
+                  <span className="w-2 h-2 rounded-full bg-sky-400" /> REPLAYING
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-rose-955 text-rose-400 border border-rose-500/35 rounded font-bold">
+                  <span className="w-2.5 h-2.5 rounded-full bg-rose-550 animate-ping absolute" />
+                  <span className="w-2.5 h-2.5 rounded-full bg-rose-600 relative" />
+                  <span>FDR: RECORDING</span>
+                </div>
+              )}
+              <span className="text-neutral-400 text-[10px] sm:text-[11px]">
+                {isReplayMode 
+                  ? `Fr: ${Math.floor(replayIndex) + 1} / ${lastSessionFrames.current.length}` 
+                  : `Buf: ${activeSessionFrames.current.length} fr`
+                }
+              </span>
+            </div>
+
+            {/* FDR Controls center */}
+            <div className="flex items-center gap-1">
+              {isReplayMode ? (
+                <>
+                  <button
+                    onClick={() => setPlayingReplay(!isPlayingReplay)}
+                    className="p-1 px-2 sm:px-3 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded font-bold text-neutral-200 flex items-center gap-1 transition"
+                    title="Play/Pause Replay"
+                  >
+                    {isPlayingReplay ? <Pause className="w-3 h-3 text-amber-400 fill-amber-400" /> : <Play className="w-3 h-3 text-emerald-400 fill-emerald-400" />}
+                    {isPlayingReplay ? 'PAUSE' : 'PLAY'}
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      updateReplayIndex(0);
+                      applyReplayFrame(0);
+                    }}
+                    className="p-1 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-neutral-300"
+                    title="Skip to Start"
+                  >
+                    <SkipBack className="w-3 h-3" />
+                  </button>
+
+                  {/* Speed cycle button */}
+                  <button
+                    onClick={() => {
+                      const speeds = [0.5, 1.0, 2.0, 4.0];
+                      const curIdx = speeds.indexOf(replaySpeed);
+                      const nextSpeed = speeds[(curIdx + 1) % speeds.length];
+                      updateReplaySpeed(nextSpeed);
+                    }}
+                    className="p-1 px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-neutral-300 font-bold"
+                    title="Cycle Playback Speed"
+                  >
+                    {replaySpeed}x
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => {
+                    if (activeSessionFrames.current.length > 10) {
+                      lastSessionFrames.current = [...activeSessionFrames.current];
+                      setHasLastFlight(true);
+                      updateReplayIndex(0);
+                      applyReplayFrame(0);
+                      setReplayMode(true);
+                      setPlayingReplay(true);
+                    } else {
+                      alert("Take off and fly first to record some flight data!");
+                    }
+                  }}
+                  disabled={activeSessionFrames.current.length <= 10}
+                  className={`p-1 px-2 sm:px-3 rounded font-bold flex items-center gap-1 transition text-[10px] sm:text-[11px] ${
+                    activeSessionFrames.current.length > 10
+                      ? 'bg-sky-600 hover:bg-sky-500 border border-sky-500 text-white'
+                      : 'bg-neutral-900 text-neutral-600 border border-neutral-800 cursor-not-allowed'
+                  }`}
+                  title="Instant Replay the current active flight session"
+                >
+                  <History className="w-3 h-3" /> INSTANT REPLAY
+                </button>
+              )}
+
+              {/* Replay Last session toggle */}
+              {hasLastFlight && !isReplayMode && (
+                <button
+                  onClick={() => {
+                    updateReplayIndex(0);
+                    applyReplayFrame(0);
+                    setReplayMode(true);
+                    setPlayingReplay(true);
+                  }}
+                  className="p-1 px-2 bg-emerald-950/80 hover:bg-emerald-900 border border-emerald-550/50 rounded font-bold text-emerald-400 text-[10px] sm:text-[11px]"
+                  title="Replay the last completed mission/flight"
+                >
+                  REPLAY LAST
+                </button>
+              )}
+
+              {isReplayMode && (
+                <button
+                  onClick={() => {
+                    setReplayMode(false);
+                    setPlayingReplay(false);
+                    initializeSimulation(); // reset and return to pilot control
+                  }}
+                  className="p-1 px-2 bg-red-950/80 hover:bg-red-900 border border-red-550/50 rounded text-red-400 font-bold"
+                  title="Exit replay and return to active pilot flight controls"
+                >
+                  EXIT
+                </button>
+              )}
+            </div>
+
+            {/* FDR Right utilities: Camera changer & JSON exports */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-neutral-500 text-[10px] hidden sm:inline">ANG:</span>
+              <select
+                value={cameraView}
+                onChange={(e) => setCameraView(e.target.value as any)}
+                className="bg-neutral-900 border border-neutral-800 text-neutral-300 rounded p-1 text-[10px] sm:text-[11px] focus:outline-none"
+              >
+                <option value="FPV">🎥 FPV</option>
+                <option value="CHASE">🎥 CHASE</option>
+                <option value="SPECTATOR">🎥 SPECTATOR</option>
+                <option value="ORBIT">🎥 ORBIT</option>
+              </select>
+
+              {/* Export flight log button */}
+              <button
+                onClick={exportFlightLog}
+                className="p-1 px-1.5 sm:px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-neutral-350 flex items-center gap-1 text-[10px] sm:text-[11px]"
+                title="Download Telemetry telemetry profile logs as JSON file"
+              >
+                <Download className="w-3 h-3 text-neutral-400" />
+                <span className="hidden md:inline">EXPORT</span>
+              </button>
+
+              {/* Import flight log button */}
+              <label className="p-1 px-1.5 sm:px-2 bg-neutral-900 hover:bg-neutral-800 border border-neutral-800 rounded text-neutral-350 flex items-center gap-1 text-[10px] sm:text-[11px] cursor-pointer">
+                <Upload className="w-3 h-3 text-neutral-400" />
+                <span className="hidden md:inline">IMPORT</span>
+                <input type="file" accept=".json" onChange={importFlightLog} className="hidden" />
+              </label>
+            </div>
+
+          </div>
+
+          {/* Progress scrubbing timeline slider (only visible in Replay Mode or as disabled in Live Mode) */}
+          <div className="flex items-center gap-3 mt-0.5 font-mono">
+            <span className="text-[9px] sm:text-[10px] text-neutral-500 min-w-[30px]">
+              {isReplayMode 
+                ? formatTime(Math.floor(lastSessionFrames.current[Math.floor(replayIndex)]?.timeElapsed || 0)) 
+                : formatTime(timeElapsed.current)
+              }
+            </span>
+            
+            <input
+              type="range"
+              min={0}
+              max={isReplayMode ? Math.max(0, lastSessionFrames.current.length - 1) : 100}
+              value={isReplayMode ? Math.floor(replayIndex) : 100}
+              disabled={!isReplayMode}
+              onChange={(e) => {
+                if (isReplayMode) {
+                  const newIdx = parseInt(e.target.value);
+                  updateReplayIndex(newIdx);
+                  applyReplayFrame(newIdx);
+                }
+              }}
+              className={`h-1 flex-1 rounded-lg appearance-none cursor-pointer ${
+                isReplayMode 
+                  ? 'bg-sky-950 accent-sky-450 border border-sky-850/45' 
+                  : 'bg-neutral-900 accent-neutral-600 border border-neutral-800'
+              }`}
+            />
+
+            <span className="text-[9px] sm:text-[10px] text-neutral-500 min-w-[30px] text-right">
+              {isReplayMode 
+                ? formatTime(Math.floor(lastSessionFrames.current[lastSessionFrames.current.length - 1]?.timeElapsed || 0)) 
+                : '--:--'
+              }
+            </span>
+          </div>
+        </div>
       </div>
 
       {/* Dual Virtual RCTransmitter RCJoysticks (Simulating joystick triggers for click/drag controls) */}
