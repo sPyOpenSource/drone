@@ -83,7 +83,9 @@ export class AssetManager {
         let mesh = glb.scene;
         
         mesh.name = filename;
-
+        if(filename == "town.glb" | filename == "tower.glb"){
+        mesh.translateY(0.2);
+      } else {
         mesh.traverse((obj) => {
           if (obj.material) {
             obj.material = new THREE.MeshLambertMaterial({
@@ -97,7 +99,7 @@ export class AssetManager {
 
         mesh.rotation.set(0, THREE.MathUtils.degToRad(rotation), 0);
         mesh.scale.set(scale / 30, scale / 30, scale / 30);
-
+      }
         this.models[name] = mesh;
 
         // Once all models are loaded

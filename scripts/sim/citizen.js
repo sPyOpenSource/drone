@@ -24,7 +24,7 @@ export class Citizen {
      * Age of the citizen in years
      * @type {number}
      */
-    this.age = 1 + Math.floor(100*Math.random());
+    this.age = 1 + Math.floor(100 * Math.random());
 
     /**
      * The current state of the citizen

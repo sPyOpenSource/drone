@@ -62,7 +62,7 @@ export class Game {
       this.initialize(this.city);
       this.start();
 
-      setInterval(this.simulate.bind(this), 1000);
+      setInterval(this.simulate.bind(this), 3000);
     });
 
     window.ui.gameWindow.addEventListener('resize', this.onResize.bind(this), false);

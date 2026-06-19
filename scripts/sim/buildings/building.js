@@ -34,6 +34,8 @@ export class Building extends SimObject {
    */
   #statusIcon = new THREE.Sprite();
 
+  hp = 1200;
+  
   constructor() {
     super();
     this.#statusIcon.visible = false;

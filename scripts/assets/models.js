@@ -114,11 +114,13 @@ export default {
   },
   "power-plant": {
     "type": "power",
-    "filename": "industry-factory-old.glb"
+    //"filename": "industry-factory-old.glb"
+    "filename": "town.glb"
   },
   "power-line": {
     "type": "power",
-    "filename": "power_line_pole_modified.glb"
+    //"filename": "power_line_pole_modified.glb"
+    "filename": "tower.glb"
   },
   "road-straight": {
     "type": "road",
